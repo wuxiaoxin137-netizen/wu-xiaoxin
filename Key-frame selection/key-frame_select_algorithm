@@ -1,1 +1,489 @@
+import os
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+from skimage.metrics import structural_similarity as ssim
+import openpyxl
+import time
+import statistics
+
+kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+
+def calculate_max_diff_frame(image_dir):
+    """
+    使用 SSIM 找出最大差异帧的索引。
+
+    返回:
+        max_diff_frame_index: 最大差异帧的索引
+        frame_ratio: 峰值对比帧位置占总帧数的比例
+    """
+    image_files = sorted([f for f in os.listdir(image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))])
+    if not image_files:
+        return None, None
+
+    total_frames = len(image_files)
+
+    start_index = 1
+    end_index = total_frames
+
+    reference_image_path = os.path.join(image_dir, image_files[0])
+    reference_image = cv2.imread(reference_image_path, cv2.IMREAD_GRAYSCALE)
+    if reference_image is None:
+        print(f"Error: Could not read reference image at {reference_image_path}")
+        return None, None
+    reference_image = reference_image.astype(np.float32)
+
+    min_diff_ssim = 1.1
+    max_diff_frame_index = 0
+
+    data_range_ref = reference_image.max() - reference_image.min() if reference_image.max() != reference_image.min() else 1.0
+
+    for i in range(start_index, end_index):
+        image_file = image_files[i]
+        image_path = os.path.join(image_dir, image_file)
+        current_image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if current_image is None:
+            print(f"Error: Could not read image at {image_path}")
+            continue
+        current_image = current_image.astype(np.float32)
+
+        if reference_image.shape != current_image.shape:
+            print(f"Error: Image shape mismatch between reference and current image at {image_path}")
+            continue
+
+        data_range_current = current_image.max() - current_image.min() if current_image.max() != current_image.min() else 1.0
+        current_ssim = ssim(reference_image, current_image, win_size=9,
+                            data_range=max(data_range_ref, data_range_current))
+
+        if current_ssim < min_diff_ssim:
+            min_diff_ssim = current_ssim
+            max_diff_frame_index = i
+
+    if min_diff_ssim != 1.1:
+        peak_contrast_ratio = (max_diff_frame_index + 1) / total_frames
+        print(f"SSIM峰值对比帧: {max_diff_frame_index}/{total_frames - 1} (比例: {peak_contrast_ratio:.2%})")
+        return max_diff_frame_index, peak_contrast_ratio
+    else:
+        return None, None
+
+
+def calculate_max_mse_frame_with_roi(image_paths, image_indices, cumulative_red_pixels, all_roi_pixels, first_frame,
+                                     img_first, back):
+    """
+     计算序列图像中红框区域与第一帧差异最大的帧的序号，使用背景建模后的 加权 MSE。
+     修改：diff_map改为在cumulative_red_pixels区域内，计算原始图像像素与255背景图的差异。
+     并调整了阈值。
+    Args:
+        image_paths: 包含序列图像的路径列表
+        image_indices: 需要计算MSE的帧的索引
+         cumulative_red_pixels: 所有红色像素坐标集合
+         all_roi_pixels：红框区域的信息
+         first_frame：第一帧图像（灰度）
+        img_first：第一帧背景建模后的图像
+        back: 背景建模器
+
+    Returns:
+        max_mse_frame_index: 最大 MSE 帧的序号（如果序列中没有图片，则返回 None）
+    """
+    if not image_paths:
+        print(f"Error: No image files provided.")
+        return None
+    if not image_indices:
+        print(f"Error: No image indices provided.")
+        return None
+    max_mse = -1
+    max_mse_frame_index = 0
+
+    all_white_background = np.full_like(first_frame, 255.0, dtype=np.float32)
+
+    for local_index, index in enumerate(image_indices):
+        if index >= len(image_paths) or index < 0:
+            if index < 0:
+                continue
+            else:
+                continue
+        image_path = image_paths[index]
+
+        frame_original_grayscale = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if frame_original_grayscale is None:
+            print(f"警告：无法读取图像文件：{image_path}")
+            continue
+        frame_original_grayscale = frame_original_grayscale.astype(np.float32)
+
+        diff_map = np.zeros_like(first_frame, dtype=np.float32)
+        for x, y in cumulative_red_pixels:
+            if 0 <= y < frame_original_grayscale.shape[0] and 0 <= x < frame_original_grayscale.shape[1]:
+                diff_map[y, x] = np.abs(frame_original_grayscale[y, x] - all_white_background[y, x])
+
+        processed_arr = np.where(diff_map < 100, 0, diff_map)
+
+        processed_tensor = torch.tensor(processed_arr, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        zeros_tensor = torch.zeros_like(processed_tensor)
+        mse = F.mse_loss(processed_tensor, zeros_tensor)
+
+        diff_tensor = torch.tensor(diff_map, dtype=torch.float32)
+        weight_tensor = torch.where(diff_tensor > 100, 1 + ((diff_tensor - 100) // 10) * 0.1, 1)
+        weighted_mse = mse * torch.mean(weight_tensor).item()
+
+        if weighted_mse > max_mse:
+            max_mse = weighted_mse
+            max_mse_frame_index = index
+
+    return max_mse_frame_index if max_mse != -1 else None
+
+
+def process_folder(root_folder, excel_file_full_path):
+    """
+    遍历主文件夹下的子文件夹，计算每个序列图像中最大差异帧，并记录到指定的Excel文件。
+    同时记录每个序列处理所需的时间。
+
+    新增功能：
+    1. 记录SSIM选取的帧索引
+    2. 记录SSIM选取与最终选取的帧数差距
+    3. 统计处理时间的平均值和标准差
+    4. 统计峰值对比帧比例的平均值和标准差
+    5. 统计SSIM与最终选取差距的平均值和标准差
+
+    Args:
+        root_folder (str): 主文件夹路径
+        excel_file_full_path (str): Excel 文件的完整保存路径 (包括文件名和扩展名)
+    """
+
+    results = []
+    processing_times = []
+    peak_contrast_ratios = []
+    final_frame_ratios = []
+    ssim_frame_indices = []
+    ssim_to_final_differences = []
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    back = cv2.createBackgroundSubtractorMOG2()
+
+    subfolders_list = sorted([d for d in os.listdir(root_folder) if os.path.isdir(os.path.join(root_folder, d))])
+
+    for subfolder in subfolders_list:
+        subfolder_path = os.path.join(root_folder, subfolder)
+        seq_folders_list = sorted(
+            [d for d in os.listdir(subfolder_path) if d.isdigit() and os.path.isdir(os.path.join(subfolder_path, d))])
+
+        for seq_folder in seq_folders_list:
+            seq_start_time = time.time()
+
+            seq_folder_path = os.path.join(subfolder_path, seq_folder)
+            image_files = sorted(
+                [f for f in os.listdir(seq_folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))])
+            if not image_files:
+                print(f"Error: No image files in {seq_folder_path}")
+                continue
+
+            first_frame_path = os.path.join(seq_folder_path, image_files[0])
+            first_frame = cv2.imread(first_frame_path, cv2.IMREAD_GRAYSCALE)
+            if first_frame is None:
+                print(f"Error: Could not read first image at {first_frame_path}")
+                continue
+
+            total_frames = len(image_files)
+
+            first_frame_float = first_frame.astype(np.float32)
+            img_first_bg_model = back.apply(first_frame.astype(np.uint8)).astype(np.float32)
+
+            cumulative_red_pixels = set()
+            all_roi_pixels = {}
+            start_roi_index = 3
+            roi_count = 0
+            saved_roi_count = 0
+
+            for index, image_file in enumerate(image_files):
+                image_path = os.path.join(seq_folder_path, image_file)
+                frame_original_grayscale = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+                if frame_original_grayscale is None:
+                    print(f"警告：无法读取图像文件：{image_path}")
+                    continue
+
+                img_bg_model = back.apply(frame_original_grayscale)
+                img_open = cv2.morphologyEx(img_bg_model, cv2.MORPH_OPEN, kernel)
+                img_close = cv2.morphologyEx(img_open, cv2.MORPH_CLOSE, kernel)
+                contours, _ = cv2.findContours(img_close, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                for cnt in contours:
+                    length = cv2.arcLength(cnt, True)
+                    if length > 200:
+                        x, y, w, h = cv2.boundingRect(cnt)
+                        if roi_count >= start_roi_index:
+                            y_start, y_end = max(0, y), min(frame_original_grayscale.shape[0], y + h)
+                            x_start, x_end = max(0, x), min(frame_original_grayscale.shape[1], x + w)
+
+                            if y_end > y_start and x_end > x_start:
+                                for i_pix in range(y_start, y_end):
+                                    for j_pix in range(x_start, x_end):
+                                        if frame_original_grayscale[i_pix, j_pix] < 100:
+                                            cumulative_red_pixels.add((j_pix, i_pix))
+                                saved_roi_count += 1
+                        roi_count += 1
+
+            ssim_frame_index, peak_contrast_ratio = calculate_max_diff_frame(seq_folder_path)
+
+            max_mse_frame_index = None
+            final_frame_ratio = None
+            ssim_to_final_diff = None
+
+            if ssim_frame_index is not None and peak_contrast_ratio is not None:
+                ssim_frame_indices.append(ssim_frame_index)
+                peak_contrast_ratios.append(peak_contrast_ratio)
+
+                key_frame_index = ssim_frame_index
+
+                potential_indices = list(range(key_frame_index - 4, key_frame_index + 5))
+
+                image_indices_for_mse = [idx for idx in potential_indices if 0 <= idx < len(image_files)]
+                full_image_paths = [os.path.join(seq_folder_path, f) for f in image_files]
+
+                max_mse_frame_index = calculate_max_mse_frame_with_roi(
+                    full_image_paths,
+                    image_indices_for_mse,
+                    cumulative_red_pixels,
+                    all_roi_pixels,
+                    first_frame_float,
+                    img_first_bg_model,
+                    back
+                )
+
+                if max_mse_frame_index is not None:
+                    final_frame_ratio = (max_mse_frame_index + 1) / total_frames
+                    final_frame_ratios.append(final_frame_ratio)
+
+                    ssim_to_final_diff = abs(max_mse_frame_index - ssim_frame_index)
+                    ssim_to_final_differences.append(ssim_to_final_diff)
+
+                    print(f"SSIM帧: {ssim_frame_index}, 最终帧: {max_mse_frame_index}, 差距: {ssim_to_final_diff}帧")
+                    print(f"SSIM比例: {peak_contrast_ratio:.2%}, 最终比例: {final_frame_ratio:.2%}")
+                else:
+                    print(f"警告：未找到MSE最大帧")
+
+                seq_end_time = time.time()
+                time_taken = seq_end_time - seq_start_time
+                processing_times.append(time_taken)
+
+                results.append({
+                    'Subfolder': subfolder,
+                    'Seq Folder': seq_folder_path,
+                    'Total Frames': total_frames,
+                    'SSIM Frame Index': ssim_frame_index,
+                    'Max MSE Frame Index': max_mse_frame_index,
+                    'SSIM to Final Difference': ssim_to_final_diff,
+                    'Final Frame Ratio': f"{final_frame_ratio:.3%}" if final_frame_ratio is not None else 'N/A',
+                    'Peak Contrast Frame Ratio': f"{peak_contrast_ratio:.3%}",
+                    'Time Taken (s)': f"{time_taken:.4f}"
+                })
+                print(
+                    f"Found max mse frame {max_mse_frame_index} using window around {key_frame_index} in {seq_folder_path}. Time: {time_taken:.4f} seconds")
+            else:
+                seq_end_time = time.time()
+                time_taken = seq_end_time - seq_start_time
+                processing_times.append(time_taken)
+
+                results.append({
+                    'Subfolder': subfolder,
+                    'Seq Folder': seq_folder_path,
+                    'Total Frames': total_frames,
+                    'SSIM Frame Index': 'N/A',
+                    'Max MSE Frame Index': 'N/A',
+                    'SSIM to Final Difference': 'N/A',
+                    'Final Frame Ratio': 'N/A',
+                    'Peak Contrast Frame Ratio': 'N/A',
+                    'Time Taken (s)': f"{time_taken:.4f}"
+                })
+                print(f"No Images or error in {seq_folder_path}. Time: {time_taken:.4f} seconds")
+
+    def calculate_statistics(data_list, data_name):
+        if not data_list:
+            return None, None, None, None
+
+        mean_val = statistics.mean(data_list)
+        if len(data_list) > 1:
+            stdev_val = statistics.stdev(data_list)
+        else:
+            stdev_val = 0
+        min_val = min(data_list)
+        max_val = max(data_list)
+
+        print(f"\n{data_name}统计:")
+        print(f"  平均值: {mean_val:.4f}")
+        print(f"  标准差: {stdev_val:.4f}")
+        print(f"  最小值: {min_val:.4f}")
+        print(f"  最大值: {max_val:.4f}")
+        print(f"  样本数: {len(data_list)}")
+
+        return mean_val, stdev_val, min_val, max_val
+
+    try:
+        excel_dir = os.path.dirname(excel_file_full_path)
+        if not os.path.exists(excel_dir):
+            os.makedirs(excel_dir)
+            print(f"创建 Excel 目标文件夹: {excel_dir}")
+
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.title = 'Keyframe_Analysis'
+
+        sheet.append(['Subfolder', 'Seq Folder', 'Total Frames', 'SSIM Frame Index',
+                      'Max MSE Frame Index', 'SSIM to Final Difference',
+                      'Final Frame Ratio', 'Peak Contrast Frame Ratio', 'Time Taken (s)'])
+
+        for row in results:
+            sheet.append(list(row.values()))
+
+        empty_row = [''] * 9
+        sheet.append(empty_row)
+
+        if processing_times:
+            time_mean, time_stdev, time_min, time_max = calculate_statistics(processing_times, "处理时间")
+            sheet.append(['处理时间统计', '', '', '', '', '', '', '', ''])
+            sheet.append(['平均值(秒)', f"{time_mean:.4f}", '', '', '', '', '', '', ''])
+            sheet.append(['标准差(秒)', f"{time_stdev:.4f}", '', '', '', '', '', '', ''])
+            sheet.append(['最小值(秒)', f"{time_min:.4f}", '', '', '', '', '', '', ''])
+            sheet.append(['最大值(秒)', f"{time_max:.4f}", '', '', '', '', '', '', ''])
+            sheet.append(['总样本数', len(processing_times), '', '', '', '', '', '', ''])
+
+        empty_row = [''] * 9
+        sheet.append(empty_row)
+
+        if peak_contrast_ratios:
+            peak_mean, peak_stdev, peak_min, peak_max = calculate_statistics(peak_contrast_ratios, "峰值对比帧比例")
+            sheet.append(['峰值对比帧比例统计', '', '', '', '', '', '', '', ''])
+            sheet.append(['平均值', f"{peak_mean:.3%}", '', '', '', '', '', '', ''])
+            sheet.append(['标准差', f"{peak_stdev:.3%}", '', '', '', '', '', '', ''])
+            sheet.append(['最小值', f"{peak_min:.3%}", '', '', '', '', '', '', ''])
+            sheet.append(['最大值', f"{peak_max:.3%}", '', '', '', '', '', '', ''])
+            sheet.append(['总样本数', len(peak_contrast_ratios), '', '', '', '', '', '', ''])
+
+        empty_row = [''] * 9
+        sheet.append(empty_row)
+
+        if final_frame_ratios:
+            final_mean, final_stdev, final_min, final_max = calculate_statistics(final_frame_ratios, "最终选取帧比例")
+            sheet.append(['最终选取帧比例统计', '', '', '', '', '', '', '', ''])
+            sheet.append(['平均值', f"{final_mean:.3%}", '', '', '', '', '', '', ''])
+            sheet.append(['标准差', f"{final_stdev:.3%}", '', '', '', '', '', '', ''])
+            sheet.append(['最小值', f"{final_min:.3%}", '', '', '', '', '', '', ''])
+            sheet.append(['最大值', f"{final_max:.3%}", '', '', '', '', '', '', ''])
+            sheet.append(['总样本数', len(final_frame_ratios), '', '', '', '', '', '', ''])
+
+        empty_row = [''] * 9
+        sheet.append(empty_row)
+
+        if ssim_to_final_differences:
+            diff_mean, diff_stdev, diff_min, diff_max = calculate_statistics(ssim_to_final_differences,
+                                                                             "SSIM与最终选取差距（帧数）")
+            sheet.append(['SSIM与最终选取差距统计', '', '', '', '', '', '', '', ''])
+            sheet.append(['平均值(帧)', f"{diff_mean:.2f}", '', '', '', '', '', '', ''])
+            sheet.append(['标准差(帧)', f"{diff_stdev:.2f}", '', '', '', '', '', '', ''])
+            sheet.append(['最小值(帧)', f"{diff_min}", '', '', '', '', '', '', ''])
+            sheet.append(['最大值(帧)', f"{diff_max}", '', '', '', '', '', '', ''])
+            sheet.append(['总样本数', len(ssim_to_final_differences), '', '', '', '', '', '', ''])
+
+            same_frame_count = sum(1 for diff in ssim_to_final_differences if diff == 0)
+            same_percent = same_frame_count / len(ssim_to_final_differences) * 100
+            sheet.append(['相同帧比例', f"{same_percent:.1f}%", '', '', '', '', '', '', ''])
+
+            within_2_frames = sum(1 for diff in ssim_to_final_differences if diff <= 2)
+            within_2_percent = within_2_frames / len(ssim_to_final_differences) * 100
+            sheet.append(['差距≤2帧比例', f"{within_2_percent:.1f}%", '', '', '', '', '', '', ''])
+
+            within_4_frames = sum(1 for diff in ssim_to_final_differences if diff <= 4)
+            within_4_percent = within_4_frames / len(ssim_to_final_differences) * 100
+            sheet.append(['差距≤4帧比例', f"{within_4_percent:.1f}%", '', '', '', '', '', '', ''])
+
+        workbook.save(excel_file_full_path)
+        print(f"\n结果已保存到 {excel_file_full_path}")
+
+        print(f"\n{'=' * 60}")
+        print(f"最终统计摘要:")
+        print(f"{'=' * 60}")
+
+        if processing_times:
+            print(
+                f"处理时间: {statistics.mean(processing_times):.4f} ± {statistics.stdev(processing_times) if len(processing_times) > 1 else 0:.4f} 秒 (n={len(processing_times)})")
+
+        if peak_contrast_ratios:
+            peak_mean = statistics.mean(peak_contrast_ratios)
+            peak_stdev = statistics.stdev(peak_contrast_ratios) if len(peak_contrast_ratios) > 1 else 0
+            print(f"峰值对比帧比例: {peak_mean:.2%} ± {peak_stdev:.2%} (n={len(peak_contrast_ratios)})")
+
+        if final_frame_ratios:
+            final_mean = statistics.mean(final_frame_ratios)
+            final_stdev = statistics.stdev(final_frame_ratios) if len(final_frame_ratios) > 1 else 0
+            print(f"最终选取帧比例: {final_mean:.2%} ± {final_stdev:.2%} (n={len(final_frame_ratios)})")
+
+        if ssim_to_final_differences:
+            diff_mean = statistics.mean(ssim_to_final_differences)
+            diff_stdev = statistics.stdev(ssim_to_final_differences) if len(ssim_to_final_differences) > 1 else 0
+            print(f"SSIM与最终选取差距: {diff_mean:.2f} ± {diff_stdev:.2f} 帧 (n={len(ssim_to_final_differences)})")
+
+            same_count = sum(1 for diff in ssim_to_final_differences if diff == 0)
+            same_percent = same_count / len(ssim_to_final_differences) * 100
+            print(f"相同帧比例: {same_percent:.1f}%")
+
+            within_4_count = sum(1 for diff in ssim_to_final_differences if diff <= 4)
+            within_4_percent = within_4_count / len(ssim_to_final_differences) * 100
+            print(f"差距在4帧以内比例: {within_4_percent:.1f}%")
+
+        print(f"{'=' * 60}")
+
+    except Exception as e:
+        print(f"Error writing to Excel file: {e}")
+
+    return processing_times, peak_contrast_ratios, final_frame_ratios, ssim_to_final_differences
+
+
+if __name__ == '__main__':
+    total_start_time = time.time()
+
+    root_dir = '/'
+    excel_output_directory = '/'
+    excel_filename = ".xlsx"   Excel_filename = ".xlsx"；
+
+    excel_file_full_path = os.path.join(excel_output_directory, excel_filename)Excel_file_full_path = os.path。加入(excel_output_directory excel_filename)
+
+    print(f"程序开始运行，根目录：{root_dir}")
+    print(f"结果将保存到Excel文件：{excel_file_full_path}\n")
+
+    processing_times, peak_contrast_ratios, final_frame_ratios, ssim_to_final_differences = process_folder(root_dir,
+                                                                                                           excel_file_full_path)
+
+    total_end_time = time.time()
+    total_time_taken = total_end_time - total_start_time
+
+    print(f"\n{'=' * 60}")
+    print(f"程序总运行时间: {total_time_taken:.4f} 秒")
+    print(f"处理序列总数: {len(processing_times)}")
+
+    if processing_times:
+        print(   打印(
+            f"平均处理时间: {statistics.mean(processing_times):.4f} ± {statistics.stdev(processing_times) if len(processing_times) > 1 else 0:.4f} 秒")f"平均处理时间: {statistics.mean(processing_times):.4f} ± {statistics.stdev(processing_times) if len(processing_times) > 1 else 0:.4f} 秒")
+
+    if peak_contrast_ratios:   如果peak_contrast_ratios:
+        peak_mean = statistics.mean(peak_contrast_ratios)Peak_mean = statistics.mean（peak_contrast_ratio）
+        peak_stdev = statistics.stdev(peak_contrast_ratios) if len(peak_contrast_ratios) > 1 else 0Peak_stdev = statistics。Stdev (peak_contrast_ratio) if len(peak_contrast_ratio) > 1 else 0
+        print(f"峰值对比帧平均比例: {peak_mean:.3%} ± {peak_stdev:.3%}")print(f"峰值对比帧平均比例: {peak_mean:.3%} ± {peak_stdev:.3%}")
+
+    if final_frame_ratios:   如果final_frame_ratios:
+        final_mean = statistics.mean(final_frame_ratios)Final_mean = statistics.mean（final_frame_ratio）
+        final_stdev = statistics.stdev(final_frame_ratios) if len(final_frame_ratios) > 1 else 0Final_stdev = statistics。Stdev (final_frame_ratio) if len(final_frame_ratio) > 1 else 0
+        print(f"最终选取帧平均比例: {final_mean:.3%} ± {final_stdev:.3%}")print(f"最终选取帧平均比例: {final_mean:.3%} ± {final_stdev:.3%}")
+
+    if ssim_to_final_differences:如果ssim_to_final_differences:
+        diff_mean = statistics.mean(ssim_to_final_differences)Diff_mean = statistics.mean（ssim_to_final_differences）
+        diff_stdev = statistics.stdev(ssim_to_final_differences) if len(ssim_to_final_differences) > 1 else 0Diff_stdev = statistics。如果len(ssim_to_final_differences) > 1 else 0
+        print(f"SSIM与最终选取差距平均误差: {diff_mean:.2f} ± {diff_stdev:.2f} 帧")
+
+        print(f"SSIM与最终选取差距分析:")
+        for threshold in [0, 1, 2, 3, 4]:
+            count = sum(1 for diff in ssim_to_final_differences if diff <= threshold)
+            percent = count / len(ssim_to_final_differences) * 100
+            print(f"  差距≤{threshold}帧: {count}/{len(ssim_to_final_differences)} ({percent:.1f}%)")
+
+    print(f"{'=' * 60}")
 
